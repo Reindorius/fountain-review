@@ -6,8 +6,8 @@ import "./PriceOracle.sol";
 import "./ComptrollerInterface.sol";
 import "./ComptrollerStorage.sol";
 import "./Unitroller.sol";
-import "./Governance/Comp.sol";
-
+import "./Governance/Ftp.sol";
+import "./SafeMath.sol";
 /**
  * @title Compound's Comptroller Contract
  * @author Compound
@@ -49,9 +49,6 @@ contract Comptroller is ComptrollerV7Storage, ComptrollerInterface, ComptrollerE
     /// @notice Emitted when a new supply-side COMP speed is calculated for a market
     event CompSupplySpeedUpdated(CToken indexed cToken, uint newSpeed);
 
-    /// @notice Emitted when a new COMP speed is set for a contributor
-    event ContributorCompSpeedUpdated(address indexed contributor, uint newSpeed);
-
     /// @notice Emitted when COMP is distributed to a supplier
     event DistributedSupplierComp(CToken indexed cToken, address indexed supplier, uint compDelta, uint compSupplyIndex);
 
@@ -85,8 +82,22 @@ contract Comptroller is ComptrollerV7Storage, ComptrollerInterface, ComptrollerE
     // No collateralFactorMantissa may exceed this value
     uint internal constant collateralFactorMaxMantissa = 0.9e18; // 0.9
 
+    uint public startSpeedTime;
+    uint public reductionPeriod;
+    bool public isMiningInit = false;
+
+    using SafeMath for uint;
+
     constructor() public {
         admin = msg.sender;
+    }
+
+    function initMining(uint256 _reductionPeriod) external{
+        require(msg.sender == admin,"only admin can call this function");
+        require(!isMiningInit,"only call once");
+        isMiningInit = true;
+        reductionPeriod = _reductionPeriod;
+        startSpeedTime = getBlockTimestamp();
     }
 
     /*** Assets You Are In ***/
@@ -958,7 +969,7 @@ contract Comptroller is ComptrollerV7Storage, ComptrollerInterface, ComptrollerE
     }
 
     function _initializeMarket(address cToken) internal {
-        uint32 blockNumber = safe32(getBlockNumber(), "block number exceeds 32 bits");
+        uint32 blockTimestamp = safe32(getBlockTimestamp(), "timestamp exceeds 32 bits");
 
         CompMarketState storage supplyState = compSupplyState[cToken];
         CompMarketState storage borrowState = compBorrowState[cToken];
@@ -979,7 +990,7 @@ contract Comptroller is ComptrollerV7Storage, ComptrollerInterface, ComptrollerE
         /*
          * Update market state block numbers
          */
-         supplyState.block = borrowState.block = blockNumber;
+         supplyState.timestamp = borrowState.timestamp = blockTimestamp;
     }
 
 
@@ -1085,54 +1096,6 @@ contract Comptroller is ComptrollerV7Storage, ComptrollerInterface, ComptrollerE
         require(unitroller._acceptImplementation() == 0, "change not authorized");
     }
 
-    /// @notice Delete this function after proposal 65 is executed
-    function fixBadAccruals(address[] calldata affectedUsers, uint[] calldata amounts) external {
-        require(msg.sender == admin, "Only admin can call this function"); // Only the timelock can call this function
-        require(!proposal65FixExecuted, "Already executed this one-off function"); // Require that this function is only called once
-        require(affectedUsers.length == amounts.length, "Invalid input");
-
-        // Loop variables
-        address user;
-        uint currentAccrual;
-        uint amountToSubtract;
-        uint newAccrual;
-
-        // Iterate through all affected users
-        for (uint i = 0; i < affectedUsers.length; ++i) {
-            user = affectedUsers[i];
-            currentAccrual = compAccrued[user];
-
-            amountToSubtract = amounts[i];
-
-            // The case where the user has claimed and received an incorrect amount of COMP.
-            // The user has less currently accrued than the amount they incorrectly received.
-            if (amountToSubtract > currentAccrual) {
-                // Amount of COMP the user owes the protocol
-                uint accountReceivable = amountToSubtract - currentAccrual; // Underflow safe since amountToSubtract > currentAccrual
-
-                uint oldReceivable = compReceivable[user];
-                uint newReceivable = add_(oldReceivable, accountReceivable);
-
-                // Accounting: record the COMP debt for the user
-                compReceivable[user] = newReceivable;
-
-                emit CompReceivableUpdated(user, oldReceivable, newReceivable);
-
-                amountToSubtract = currentAccrual;
-            }
-            
-            if (amountToSubtract > 0) {
-                // Subtract the bad accrual amount from what they have accrued.
-                // Users will keep whatever they have correctly accrued.
-                compAccrued[user] = newAccrual = sub_(currentAccrual, amountToSubtract);
-
-                emit CompAccruedAdjusted(user, currentAccrual, newAccrual);
-            }
-        }
-
-        proposal65FixExecuted = true; // Makes it so that this function cannot be called again
-    }
-
     /**
      * @notice Checks caller is admin, or this contract is becoming the new implementation
      */
@@ -1151,13 +1114,12 @@ contract Comptroller is ComptrollerV7Storage, ComptrollerInterface, ComptrollerE
     function setCompSpeedInternal(CToken cToken, uint supplySpeed, uint borrowSpeed) internal {
         Market storage market = markets[address(cToken)];
         require(market.isListed, "comp market is not listed");
-
         if (compSupplySpeeds[address(cToken)] != supplySpeed) {
             // Supply speed updated so let's update supply state to ensure that
             //  1. COMP accrued properly for the old speed, and
             //  2. COMP accrued at the new speed starts after this block.
             updateCompSupplyIndex(address(cToken));
-
+            
             // Update speed and emit event
             compSupplySpeeds[address(cToken)] = supplySpeed;
             emit CompSupplySpeedUpdated(cToken, supplySpeed);
@@ -1183,17 +1145,17 @@ contract Comptroller is ComptrollerV7Storage, ComptrollerInterface, ComptrollerE
      */
     function updateCompSupplyIndex(address cToken) internal {
         CompMarketState storage supplyState = compSupplyState[cToken];
-        uint supplySpeed = compSupplySpeeds[cToken];
-        uint32 blockNumber = safe32(getBlockNumber(), "block number exceeds 32 bits");
-        uint deltaBlocks = sub_(uint(blockNumber), uint(supplyState.block));
-        if (deltaBlocks > 0 && supplySpeed > 0) {
+        uint supplySpeed = getCurrentSupplySpeed(cToken);
+        uint32 blockTimestamp = safe32(getBlockTimestamp(), "timestamp exceeds 32 bits");
+        uint deltaTimes = sub_(uint(blockTimestamp), uint(supplyState.timestamp));
+        if (deltaTimes > 0 && supplySpeed > 0) {
             uint supplyTokens = CToken(cToken).totalSupply();
-            uint compAccrued = mul_(deltaBlocks, supplySpeed);
+            uint compAccrued = mul_(deltaTimes, supplySpeed);
             Double memory ratio = supplyTokens > 0 ? fraction(compAccrued, supplyTokens) : Double({mantissa: 0});
             supplyState.index = safe224(add_(Double({mantissa: supplyState.index}), ratio).mantissa, "new index exceeds 224 bits");
-            supplyState.block = blockNumber;
-        } else if (deltaBlocks > 0) {
-            supplyState.block = blockNumber;
+            supplyState.timestamp = blockTimestamp;
+        } else if (deltaTimes > 0) {
+            supplyState.timestamp = blockTimestamp;
         }
     }
 
@@ -1204,18 +1166,43 @@ contract Comptroller is ComptrollerV7Storage, ComptrollerInterface, ComptrollerE
      */
     function updateCompBorrowIndex(address cToken, Exp memory marketBorrowIndex) internal {
         CompMarketState storage borrowState = compBorrowState[cToken];
-        uint borrowSpeed = compBorrowSpeeds[cToken];
-        uint32 blockNumber = safe32(getBlockNumber(), "block number exceeds 32 bits");
-        uint deltaBlocks = sub_(uint(blockNumber), uint(borrowState.block));
-        if (deltaBlocks > 0 && borrowSpeed > 0) {
+        uint borrowSpeed = getCurrentBorrowSpeed(cToken);
+        uint32 blockTimestamp = safe32(getBlockTimestamp(), "timestamp exceeds 32 bits");
+        uint deltaTime = sub_(uint(blockTimestamp), uint(borrowState.timestamp));
+        if (deltaTime > 0 && borrowSpeed > 0) {
             uint borrowAmount = div_(CToken(cToken).totalBorrows(), marketBorrowIndex);
-            uint compAccrued = mul_(deltaBlocks, borrowSpeed);
+            uint compAccrued = mul_(deltaTime, borrowSpeed);
             Double memory ratio = borrowAmount > 0 ? fraction(compAccrued, borrowAmount) : Double({mantissa: 0});
             borrowState.index = safe224(add_(Double({mantissa: borrowState.index}), ratio).mantissa, "new index exceeds 224 bits");
-            borrowState.block = blockNumber;
-        } else if (deltaBlocks > 0) {
-            borrowState.block = blockNumber;
+            borrowState.timestamp = blockTimestamp;
+        } else if (deltaTime > 0) {
+            borrowState.timestamp = blockTimestamp;
         }
+    }
+
+    function getCurrentBorrowSpeed(address cToken) public view returns(uint) {
+       uint baseSpeed = compBorrowSpeeds[cToken];
+       return currentSpeed(baseSpeed);
+    }
+
+    function getCurrentSupplySpeed(address cToken) public view returns(uint) {
+       uint baseSpeed = compSupplySpeeds[cToken];
+       return currentSpeed(baseSpeed);
+    }
+
+    function currentSpeed(uint baseSpeed) internal view returns(uint){
+       uint timestamp = getBlockTimestamp();
+       uint delta = timestamp.sub(startSpeedTime);
+       uint exp = delta.div(reductionPeriod);
+       
+       if(exp > 48){
+           return 0;
+       }
+       if(exp > 24){
+           return baseSpeed.mul(95 ** 24).div(100 ** 24).mul(95 ** (exp - 24)).div(100 ** (exp - 24));
+       }else{
+           return baseSpeed.mul(95 ** exp).div(100 ** exp);
+       }  
     }
 
     /**
@@ -1296,23 +1283,6 @@ contract Comptroller is ComptrollerV7Storage, ComptrollerInterface, ComptrollerE
     }
 
     /**
-     * @notice Calculate additional accrued COMP for a contributor since last accrual
-     * @param contributor The address to calculate contributor rewards for
-     */
-    function updateContributorRewards(address contributor) public {
-        uint compSpeed = compContributorSpeeds[contributor];
-        uint blockNumber = getBlockNumber();
-        uint deltaBlocks = sub_(blockNumber, lastContributorBlock[contributor]);
-        if (deltaBlocks > 0 && compSpeed > 0) {
-            uint newAccrued = mul_(deltaBlocks, compSpeed);
-            uint contributorAccrued = add_(compAccrued[contributor], newAccrued);
-
-            compAccrued[contributor] = contributorAccrued;
-            lastContributorBlock[contributor] = blockNumber;
-        }
-    }
-
-    /**
      * @notice Claim all the comp accrued by holder in all markets
      * @param holder The address to claim COMP for
      */
@@ -1369,10 +1339,10 @@ contract Comptroller is ComptrollerV7Storage, ComptrollerInterface, ComptrollerE
      * @return The amount of COMP which was NOT transferred to the user
      */
     function grantCompInternal(address user, uint amount) internal returns (uint) {
-        Comp comp = Comp(getCompAddress());
-        uint compRemaining = comp.balanceOf(address(this));
+        Ftp ftp = Ftp(getCompAddress());
+        uint compRemaining = ftp.balanceOf(address(this));
         if (amount > 0 && amount <= compRemaining) {
-            comp.transfer(user, amount);
+            ftp.transfer(user, amount);
             return 0;
         }
         return amount;
@@ -1404,31 +1374,10 @@ contract Comptroller is ComptrollerV7Storage, ComptrollerInterface, ComptrollerE
 
         uint numTokens = cTokens.length;
         require(numTokens == supplySpeeds.length && numTokens == borrowSpeeds.length, "Comptroller::_setCompSpeeds invalid input");
-
         for (uint i = 0; i < numTokens; ++i) {
             setCompSpeedInternal(cTokens[i], supplySpeeds[i], borrowSpeeds[i]);
+            
         }
-    }
-
-    /**
-     * @notice Set COMP speed for a single contributor
-     * @param contributor The contributor whose COMP speed to update
-     * @param compSpeed New COMP speed for contributor
-     */
-    function _setContributorCompSpeed(address contributor, uint compSpeed) public {
-        require(adminOrInitializing(), "only admin can set comp speed");
-
-        // note that COMP speed could be set to 0 to halt liquidity rewards for a contributor
-        updateContributorRewards(contributor);
-        if (compSpeed == 0) {
-            // release storage
-            delete lastContributorBlock[contributor];
-        } else {
-            lastContributorBlock[contributor] = getBlockNumber();
-        }
-        compContributorSpeeds[contributor] = compSpeed;
-
-        emit ContributorCompSpeedUpdated(contributor, compSpeed);
     }
 
     /**
@@ -1453,15 +1402,20 @@ contract Comptroller is ComptrollerV7Storage, ComptrollerInterface, ComptrollerE
         ;
     }
 
-    function getBlockNumber() public view returns (uint) {
-        return block.number;
+    // function getBlockNumber() public view returns (uint) {
+    //     return block.number;
+    // }
+
+    function getBlockTimestamp() public view returns (uint) {
+        return block.timestamp;
     }
 
-    /**
+        /**
      * @notice Return the address of the COMP token
      * @return The address of COMP
      */
     function getCompAddress() public view returns (address) {
-        return 0xc00e94Cb662C3520282E6f5717214004A7f26888;
+        return 0x08ed252BDA5AA73a5094DFa19Fc0B76C6d2291B0;
     }
+
 }

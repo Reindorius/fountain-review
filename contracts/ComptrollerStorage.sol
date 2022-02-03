@@ -99,8 +99,9 @@ contract ComptrollerV3Storage is ComptrollerV2Storage {
         /// @notice The market's last updated compBorrowIndex or compSupplyIndex
         uint224 index;
 
-        /// @notice The block number the index was last updated at
-        uint32 block;
+        // /// @notice The block number the index was last updated at
+        // uint32 block;
+        uint32 timestamp;
     }
 
     /// @notice A list of all markets
@@ -137,11 +138,7 @@ contract ComptrollerV4Storage is ComptrollerV3Storage {
 }
 
 contract ComptrollerV5Storage is ComptrollerV4Storage {
-    /// @notice The portion of COMP that each contributor receives per block
-    mapping(address => uint) public compContributorSpeeds;
 
-    /// @notice Last block at which a contributor's COMP rewards have been allocated
-    mapping(address => uint) public lastContributorBlock;
 }
 
 contract ComptrollerV6Storage is ComptrollerV5Storage {
@@ -153,9 +150,6 @@ contract ComptrollerV6Storage is ComptrollerV5Storage {
 }
 
 contract ComptrollerV7Storage is ComptrollerV6Storage {
-    /// @notice Flag indicating whether the function to fix COMP accruals has been executed (RE: proposal 62 bug)
-    bool public proposal65FixExecuted;
-
     /// @notice Accounting storage mapping account addresses to how much COMP they owe the protocol.
     mapping(address => uint) public compReceivable;
 }

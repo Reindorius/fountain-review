@@ -1,7 +1,6 @@
 pragma solidity ^0.5.16;
 
 import "./SafeMath.sol";
-
 contract Timelock {
     using SafeMath for uint;
 
@@ -15,7 +14,7 @@ contract Timelock {
     uint public constant GRACE_PERIOD = 14 days;
     uint public constant MINIMUM_DELAY = 2 days;
     uint public constant MAXIMUM_DELAY = 30 days;
-
+    uint public deadline;
     address public admin;
     address public pendingAdmin;
     uint public delay;
@@ -26,7 +25,7 @@ contract Timelock {
     constructor(address admin_, uint delay_) public {
         require(delay_ >= MINIMUM_DELAY, "Timelock::constructor: Delay must exceed minimum delay.");
         require(delay_ <= MAXIMUM_DELAY, "Timelock::setDelay: Delay must not exceed maximum delay.");
-
+        deadline = block.timestamp + 180 days;
         admin = admin_;
         delay = delay_;
     }
@@ -100,6 +99,28 @@ contract Timelock {
         require(success, "Timelock::executeTransaction: Transaction execution reverted.");
 
         emit ExecuteTransaction(txHash, target, value, signature, data, eta);
+
+        return returnData;
+    }
+
+    function executeImmediate(address target, uint value, string memory signature, bytes memory data) public payable returns (bytes memory) {
+        require(msg.sender == admin, "Timelock::executeTransaction: Call must come from admin.");
+        // bytes32 txHash = keccak256(abi.encode(target, value, signature, data, eta));
+        require(getBlockTimestamp() < deadline,"out of deadline");
+     
+
+        bytes memory callData;
+
+        if (bytes(signature).length == 0) {
+            callData = data;
+        } else {
+            callData = abi.encodePacked(bytes4(keccak256(bytes(signature))), data);
+        }
+
+        // solium-disable-next-line security/no-call-value
+        (bool success, bytes memory returnData) = target.call.value(value)(callData);
+        require(success, "Timelock::executeTransaction: Transaction execution reverted.");
+        // emit ExecuteTransaction(txHash, target, value, signature, data, eta);
 
         return returnData;
     }
